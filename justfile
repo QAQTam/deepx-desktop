@@ -29,4 +29,4 @@ package:
 package-local backend="../DeepX":
     node scripts/prepare-daemon.mjs --backend-root "{{backend}}"
     pnpm build
-    pnpm exec electron-builder --win nsis --x64
+    pnpm exec electron-builder --win nsis --x64 --publish never
