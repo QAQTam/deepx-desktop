@@ -13,9 +13,9 @@ const backend = new DaemonControlClient(
 if (smokeMode) {
   setTimeout(() => {
     backend.close();
-    console.error("Electron smoke test timed out before the preload bridge was ready");
+    console.error("Electron smoke test timed out before the preload/backend bridge was ready");
     app.exit(1);
-  }, 15_000);
+  }, 30_000);
 }
 
 function createWindow(): void {
@@ -42,9 +42,19 @@ function createWindow(): void {
       const bridgeReady = await mainWindow?.webContents.executeJavaScript(
         "Boolean(window.deepx?.backend && window.deepx?.desktop)",
       );
+      let backendReady = false;
+      if (bridgeReady) {
+        try {
+          await backend.connect();
+          backendReady = backend.currentStatus().connected;
+        } catch (error) {
+          console.error("Electron backend lifecycle smoke test failed:", error);
+        }
+      }
       backend.close();
       if (!bridgeReady) console.error("Electron preload bridge was not exposed to the renderer");
-      app.exit(bridgeReady ? 0 : 1);
+      if (!backendReady) console.error("Electron could not connect to a compatible daemon");
+      app.exit(bridgeReady && backendReady ? 0 : 1);
     });
   }
   if (!smokeMode) mainWindow.once("ready-to-show", () => mainWindow?.show());

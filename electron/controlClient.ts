@@ -5,7 +5,8 @@ import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { app } from "electron";
 import WebSocket from "ws";
-import type { BackendStatus, ControlMessage, DaemonDiscovery } from "./types";
+import { daemonIdentityMismatch, hasActiveDaemonWork, type ExpectedDaemonIdentity } from "../src/runtime/daemonLifecycle";
+import type { BackendStatus, ControlMessage, DaemonDiscovery, DaemonManifest } from "./types";
 
 const PROTOCOL_VERSION = 1;
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -22,10 +23,12 @@ export class DaemonControlClient {
   private connecting?: Promise<void>;
   private heartbeat?: NodeJS.Timeout;
   private reconnect?: NodeJS.Timeout;
+  private upgradeCheck?: NodeJS.Timeout;
   private readonly pending = new Map<string, Pending>();
   private readonly attached = new Set<string>();
   private readonly clientId = `electron-${randomUUID()}`;
   private stopped = false;
+  private restarting = false;
   private status: BackendStatus = { connected: false };
 
   constructor(
@@ -79,22 +82,49 @@ export class DaemonControlClient {
   close(): void {
     this.stopped = true;
     if (this.reconnect) clearTimeout(this.reconnect);
+    if (this.upgradeCheck) clearTimeout(this.upgradeCheck);
     this.disconnectSocket();
   }
 
   private async connectOrLaunch(): Promise<void> {
+    const expected = await expectedDaemonIdentity();
+    let lastError: unknown = new Error("daemon did not publish discovery");
     try {
-      await this.connectDiscovery(await readDiscovery());
+      const discovery = await readDiscovery();
+      await this.connectDiscovery(discovery);
+      const mismatch = daemonIdentityMismatch(discovery, expected);
+      if (!mismatch) return;
+
+      const activities = await this.roundTrip({
+        type: "request",
+        request_id: randomUUID(),
+        method: "session.activity",
+        params: {},
+      });
+      if (hasActiveDaemonWork(activities)) {
+        this.setStatus({ connected: true, updatePending: true });
+        this.scheduleUpgrade(discovery, expected);
+        return;
+      }
+      await this.takeOverDaemon(discovery, expected, true);
       return;
-    } catch {}
+    } catch (error) {
+      lastError = error;
+      this.disconnectSocket();
+    }
 
     launchDaemon();
     const deadline = Date.now() + START_TIMEOUT_MS;
-    let lastError: unknown = new Error("daemon did not publish discovery");
     while (Date.now() < deadline) {
       await delay(120);
       try {
-        await this.connectDiscovery(await readDiscovery());
+        const discovery = await readDiscovery();
+        const mismatch = daemonIdentityMismatch(discovery, expected);
+        if (mismatch) {
+          lastError = new Error(`incompatible daemon: ${mismatch}`);
+          continue;
+        }
+        await this.connectDiscovery(discovery);
         return;
       } catch (error) {
         lastError = error;
@@ -103,6 +133,58 @@ export class DaemonControlClient {
     const message = errorMessage(lastError);
     this.setStatus({ connected: false, error: message });
     throw new Error(message);
+  }
+
+  private scheduleUpgrade(discovery: DaemonDiscovery, expected: ExpectedDaemonIdentity): void {
+    if (this.upgradeCheck) clearTimeout(this.upgradeCheck);
+    this.upgradeCheck = setTimeout(async () => {
+      this.upgradeCheck = undefined;
+      if (this.stopped || this.restarting) return;
+      try {
+        const activities = await this.roundTrip({
+          type: "request",
+          request_id: randomUUID(),
+          method: "session.activity",
+          params: {},
+        });
+        if (hasActiveDaemonWork(activities)) {
+          this.scheduleUpgrade(discovery, expected);
+          return;
+        }
+        await this.takeOverDaemon(discovery, expected, true);
+      } catch {
+        if (!this.stopped) this.scheduleUpgrade(discovery, expected);
+      }
+    }, 5_000);
+  }
+
+  private async takeOverDaemon(
+    discovery: DaemonDiscovery,
+    expected: ExpectedDaemonIdentity,
+    allowLegacyStop: boolean,
+  ): Promise<void> {
+    this.restarting = true;
+    try {
+      let stopped = await requestDaemonStop(discovery, true);
+      if (stopped === "busy") {
+        this.setStatus({ connected: true, updatePending: true });
+        this.scheduleUpgrade(discovery, expected);
+        return;
+      }
+      if (stopped === "unsupported" && allowLegacyStop) {
+        stopped = await requestDaemonStop(discovery, false);
+      }
+      if (stopped !== "stopping") throw new Error("daemon refused lifecycle takeover");
+
+      this.disconnectSocket();
+      await waitForDaemonExit(discovery.pid);
+      launchDaemon();
+      const replacement = await waitForCompatibleDiscovery(expected);
+      await this.connectDiscovery(replacement);
+      this.setStatus({ connected: true });
+    } finally {
+      this.restarting = false;
+    }
   }
 
   private async connectDiscovery(discovery: DaemonDiscovery): Promise<void> {
@@ -211,7 +293,7 @@ export class DaemonControlClient {
     if (this.socket?.readyState === WebSocket.OPEN) return;
     this.disconnectSocket();
     this.setStatus({ connected: false, error: reason });
-    if (!this.stopped && !this.reconnect) {
+    if (!this.stopped && !this.restarting && !this.reconnect) {
       this.reconnect = setTimeout(() => {
         this.reconnect = undefined;
         void this.connect().catch(() => this.handleDisconnect("daemon reconnect failed"));
@@ -245,6 +327,72 @@ function deepxDataDir(): string {
 
 async function readDiscovery(): Promise<DaemonDiscovery> {
   return JSON.parse(await readFile(join(deepxDataDir(), "daemon.json"), "utf8")) as DaemonDiscovery;
+}
+
+async function expectedDaemonIdentity(): Promise<ExpectedDaemonIdentity> {
+  if (!app.isPackaged) {
+    return {
+      protocol_version: PROTOCOL_VERSION,
+      version: app.getVersion(),
+      channel: "dev",
+    };
+  }
+  const manifest = JSON.parse(
+    await readFile(join(process.resourcesPath, "daemon-manifest.json"), "utf8"),
+  ) as DaemonManifest;
+  return {
+    protocol_version: manifest.protocol_version,
+    version: manifest.version,
+    build_id: manifest.build_id,
+    channel: manifest.channel,
+  };
+}
+
+async function requestDaemonStop(
+  discovery: DaemonDiscovery,
+  idleOnly: boolean,
+): Promise<"stopping" | "busy" | "unsupported"> {
+  const url = new URL(discovery.endpoint.replace(/^ws:/, "http:"));
+  url.pathname = idleOnly ? "/control/v1/stop-if-idle" : "/control/v1/stop";
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${discovery.token}` },
+    });
+    if (response.status === 200) return "stopping";
+    if (response.status === 409) return "busy";
+    return "unsupported";
+  } catch {
+    return "unsupported";
+  }
+}
+
+async function waitForDaemonExit(pid: number): Promise<void> {
+  const deadline = Date.now() + START_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await delay(100);
+    try {
+      const discovery = await readDiscovery();
+      if (discovery.pid !== pid) return;
+    } catch {
+      return;
+    }
+  }
+  throw new Error("old daemon did not stop in time");
+}
+
+async function waitForCompatibleDiscovery(expected: ExpectedDaemonIdentity): Promise<DaemonDiscovery> {
+  const deadline = Date.now() + START_TIMEOUT_MS;
+  let mismatch = "daemon discovery unavailable";
+  while (Date.now() < deadline) {
+    await delay(120);
+    try {
+      const discovery = await readDiscovery();
+      mismatch = daemonIdentityMismatch(discovery, expected) ?? "";
+      if (!mismatch) return discovery;
+    } catch {}
+  }
+  throw new Error(`replacement daemon did not start: ${mismatch}`);
 }
 
 function daemonPath(): string {

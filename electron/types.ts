@@ -4,6 +4,17 @@ export interface DaemonDiscovery {
   pid: number;
   server_epoch: string;
   protocol_version: number;
+  daemon_version?: string;
+  build_id?: string;
+  channel?: string;
+  executable?: string;
+}
+
+export interface DaemonManifest {
+  version: string;
+  protocol_version: number;
+  build_id: string;
+  channel: string;
 }
 
 export type ControlMessage = {
@@ -18,6 +29,7 @@ export type ControlMessage = {
 export interface BackendStatus {
   connected: boolean;
   error?: string;
+  updatePending?: boolean;
 }
 
 export interface OpenDialogOptions {

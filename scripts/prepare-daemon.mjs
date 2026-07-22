@@ -20,8 +20,15 @@ if (process.env.GITHUB_REF_NAME?.startsWith("v") && process.env.GITHUB_REF_NAME 
 }
 mkdirSync(dirname(destination), { recursive: true });
 
-if (explicitBackend) await stageLocalBackend(resolve(explicitBackend));
-else await stageReleaseArtifact();
+const stagedBuildId = explicitBackend
+  ? await stageLocalBackend(resolve(explicitBackend))
+  : await stageReleaseArtifact();
+writeFileSync(join(dirname(destination), "daemon-manifest.json"), `${JSON.stringify({
+  version: lock.version,
+  protocol_version: lock.protocol_version,
+  build_id: stagedBuildId,
+  channel: "stable",
+}, null, 2)}\n`);
 
 async function stageLocalBackend(backendRoot) {
   const cargoToml = join(backendRoot, "Cargo.toml");
@@ -44,6 +51,7 @@ async function stageLocalBackend(backendRoot) {
   if (!existsSync(source)) throw new Error(`Cargo completed without producing ${source}`);
   copyFileSync(source, destination);
   console.log(`Staged local backend ${source} -> ${destination}`);
+  return gitCommit(backendRoot);
 }
 
 async function stageReleaseArtifact() {
@@ -72,6 +80,18 @@ async function stageReleaseArtifact() {
     chmodSync(destination, 0o755);
   }
   console.log(`Staged locked backend ${lock.version} (${lock.git_commit.slice(0, 12)}) for ${targetId}`);
+  return lock.git_commit;
+}
+
+function gitCommit(backendRoot) {
+  const result = spawnSync("git", ["rev-parse", "HEAD"], {
+    cwd: backendRoot,
+    encoding: "utf8",
+    shell: false,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`Unable to resolve backend git commit: ${result.stderr.trim()}`);
+  return result.stdout.trim();
 }
 
 function validateDesktopProtocol() {
