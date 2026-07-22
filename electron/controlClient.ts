@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import { app } from "electron";
 import WebSocket from "ws";
 import { daemonIdentityMismatch, hasActiveDaemonWork, type ExpectedDaemonIdentity } from "../src/runtime/daemonLifecycle";
+import { ControlEventBatcher } from "../src/runtime/controlEventBatcher";
 import type { BackendStatus, ControlMessage, DaemonDiscovery, DaemonManifest } from "./types";
 
 const PROTOCOL_VERSION = 1;
@@ -24,6 +25,8 @@ export class DaemonControlClient {
   private heartbeat?: NodeJS.Timeout;
   private reconnect?: NodeJS.Timeout;
   private upgradeCheck?: NodeJS.Timeout;
+  private streamFlush?: NodeJS.Timeout;
+  private readonly eventBatcher = new ControlEventBatcher();
   private readonly pending = new Map<string, Pending>();
   private readonly attached = new Set<string>();
   private readonly clientId = `electron-${randomUUID()}`;
@@ -252,7 +255,20 @@ export class DaemonControlClient {
         else pending.reject(new Error(`${String(message.code ?? message.type)}: ${String(message.message ?? "request failed")}`));
       }
     }
-    this.onMessage(message);
+    const ready = this.eventBatcher.push(message);
+    if (ready.length === 0) {
+      this.scheduleStreamFlush();
+      return;
+    }
+    for (const outgoing of ready) this.onMessage(outgoing);
+  }
+
+  private scheduleStreamFlush(): void {
+    if (this.streamFlush) return;
+    this.streamFlush = setTimeout(() => {
+      this.streamFlush = undefined;
+      for (const message of this.eventBatcher.flush()) this.onMessage(message);
+    }, 16);
   }
 
   private async attachWire(seed: string): Promise<unknown> {
@@ -304,6 +320,9 @@ export class DaemonControlClient {
   private disconnectSocket(): void {
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = undefined;
+    if (this.streamFlush) clearTimeout(this.streamFlush);
+    this.streamFlush = undefined;
+    for (const message of this.eventBatcher.flush()) this.onMessage(message);
     const socket = this.socket;
     this.socket = undefined;
     if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
