@@ -41,4 +41,17 @@ pnpm test
 pnpm build
 ```
 
+## Windows package
+
+The packaging step builds the sibling Rust daemon in release mode, stages it as
+an Electron extra resource, and produces an x64 NSIS installer:
+
+```powershell
+pnpm package:win
+```
+
+Artifacts are written to `release/`. If the backend repository is not located at
+`D:\DeepX`, set `DEEPX_BACKEND_ROOT` before packaging. Use `pnpm package:dir` to
+produce only an unpacked application for quick integration checks.
+
 Closing Desktop does not stop the daemon or running Agent workers.

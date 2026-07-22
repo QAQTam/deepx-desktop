@@ -2,5 +2,9 @@ node_modules/
 out/
 dist/
 release/
+build/sidecar/
+build/icon.ico
+build/icon.png
+build/legacy-icon-32.*
 *.log
 .DS_Store
