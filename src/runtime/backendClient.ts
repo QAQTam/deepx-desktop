@@ -10,10 +10,16 @@ const listeners = new Map<string, Set<Listener>>();
 const attached = new Set<string>();
 let bridgeReady = false;
 
+function backendBridge(): NonNullable<Window["deepx"]>["backend"] {
+  const backend = window.deepx?.backend;
+  if (!backend) throw new Error("Electron preload bridge is unavailable");
+  return backend;
+}
+
 function ensureBridgeListener(): void {
   if (bridgeReady) return;
   bridgeReady = true;
-  window.deepx.backend.onMessage(payload => {
+  backendBridge().onMessage(payload => {
     if (payload.type === "event") dispatch(`agent-${String(payload.seed)}-event`, payload.event);
     else if (payload.type === "session_activity") dispatch("session-activity", payload.activity);
     else if (payload.type === "snapshot") {
@@ -27,7 +33,7 @@ function ensureBridgeListener(): void {
     } else if (payload.type === "error" && payload.code === "disconnected") attached.clear();
     dispatch("backend-message", payload);
   });
-  window.deepx.backend.onStatus(payload => dispatch("backend-status", payload));
+  backendBridge().onStatus(payload => dispatch("backend-status", payload));
 }
 
 function dispatch(name: string, payload: unknown): void {
@@ -37,7 +43,7 @@ function dispatch(name: string, payload: unknown): void {
 async function attach(seed: string): Promise<void> {
   if (!seed || attached.has(seed)) return;
   ensureBridgeListener();
-  await window.deepx.backend.attach(seed);
+  await backendBridge().attach(seed);
   attached.add(seed);
 }
 
@@ -48,16 +54,16 @@ export async function request<T>(method: string, params: Record<string, unknown>
   const needsLease = ["session", "interaction", "workspace", "git", "plan", "skills"].includes(domain)
     && !["session.list", "session.activity", "session.new", "skills.list_tools"].includes(method);
   if (needsLease && seed) await attach(seed);
-  return window.deepx.backend.request(method, params) as Promise<T>;
+  return backendBridge().request(method, params) as Promise<T>;
 }
 
 export async function connect(): Promise<void> {
   ensureBridgeListener();
-  await window.deepx.backend.connect();
+  await backendBridge().connect();
 }
 
 export async function backendStatus(): Promise<{ connected: boolean; error?: string }> {
-  return window.deepx.backend.status();
+  return backendBridge().status();
 }
 
 export async function listen<T>(name: string, listener: Listener<T>): Promise<UnlistenFn> {
@@ -74,5 +80,5 @@ export async function listen<T>(name: string, listener: Listener<T>): Promise<Un
 
 export async function detachSession(seed: string): Promise<void> {
   if (!attached.delete(seed)) return;
-  await window.deepx.backend.detach(seed);
+  await backendBridge().detach(seed);
 }

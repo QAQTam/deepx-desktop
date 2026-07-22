@@ -13,8 +13,9 @@ const backend = new DaemonControlClient(
 if (smokeMode) {
   setTimeout(() => {
     backend.close();
-    app.exit(0);
-  }, 5_000);
+    console.error("Electron smoke test timed out before the preload bridge was ready");
+    app.exit(1);
+  }, 15_000);
 }
 
 function createWindow(): void {
@@ -26,13 +27,26 @@ function createWindow(): void {
     minHeight: 600,
     show: false,
     webPreferences: {
-      preload: join(__dirname, "../preload/preload.js"),
+      preload: join(__dirname, "../preload/preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
       webSecurity: true,
     },
   });
+  mainWindow.webContents.on("preload-error", (_event, preloadPath, error) => {
+    console.error(`Failed to load preload ${preloadPath}:`, error);
+  });
+  if (smokeMode) {
+    mainWindow.webContents.once("did-finish-load", async () => {
+      const bridgeReady = await mainWindow?.webContents.executeJavaScript(
+        "Boolean(window.deepx?.backend && window.deepx?.desktop)",
+      );
+      backend.close();
+      if (!bridgeReady) console.error("Electron preload bridge was not exposed to the renderer");
+      app.exit(bridgeReady ? 0 : 1);
+    });
+  }
   if (!smokeMode) mainWindow.once("ready-to-show", () => mainWindow?.show());
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith("https://") || url.startsWith("http://")) void shell.openExternal(url);

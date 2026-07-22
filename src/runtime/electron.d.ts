@@ -22,7 +22,7 @@ interface DeepxDesktopApi {
 
 declare global {
   interface Window {
-    deepx: DeepxDesktopApi;
+    deepx?: DeepxDesktopApi;
   }
 }
 

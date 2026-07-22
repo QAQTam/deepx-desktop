@@ -9,14 +9,20 @@ export interface ConfirmDialogOptions {
   kind?: "info" | "warning" | "error";
 }
 
+function desktopBridge(): NonNullable<Window["deepx"]>["desktop"] {
+  const desktop = window.deepx?.desktop;
+  if (!desktop) throw new Error("Electron preload bridge is unavailable");
+  return desktop;
+}
+
 export function openDialog(options: OpenDialogOptions = {}): Promise<string | string[] | null> {
-  return window.deepx.desktop.openDialog(options);
+  return desktopBridge().openDialog(options);
 }
 
 export function confirmDialog(message: string, options?: ConfirmDialogOptions): Promise<boolean> {
-  return window.deepx.desktop.confirm(message, options);
+  return desktopBridge().confirm(message, options);
 }
 
 export function openPath(target: string): Promise<void> {
-  return window.deepx.desktop.openPath(target);
+  return desktopBridge().openPath(target);
 }
