@@ -43,15 +43,18 @@ pnpm build
 
 ## Windows package
 
-The packaging step builds the sibling Rust daemon in release mode, stages it as
+The reproducible packaging path downloads the backend release pinned by
+`deepx-backend.lock.json`, verifies its manifest commit and SHA-256, stages it as
 an Electron extra resource, and produces an x64 NSIS installer:
 
 ```powershell
 pnpm package:win
 ```
 
-Artifacts are written to `release/`. If the backend repository is not located at
-`D:\DeepX`, set `DEEPX_BACKEND_ROOT` before packaging. Use `pnpm package:dir` to
-produce only an unpacked application for quick integration checks.
+Artifacts are written to `release/`. For source integration, use
+`just package-local <backend-path>` or set `DEEPX_BACKEND_ROOT`; local builds must
+still match the locked product and protocol versions. Use `pnpm package:dir` for
+an unpacked application backed by the published daemon, or
+`pnpm package:dir:local` for the sibling `D:\DeepX` checkout.
 
 Closing Desktop does not stop the daemon or running Agent workers.

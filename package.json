@@ -5,14 +5,18 @@
   "author": "DeepX",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@11.15.0",
   "main": "./out/main/main.js",
   "scripts": {
     "dev": "electron-vite dev",
     "build": "pnpm typecheck && electron-vite build",
     "start": "electron-vite preview",
     "prepare:daemon": "node scripts/prepare-daemon.mjs",
+    "prepare:daemon:local": "node scripts/prepare-daemon.mjs --backend-root ../DeepX",
     "package:dir": "pnpm prepare:daemon && pnpm build && electron-builder --dir --win --x64",
+    "package:dir:local": "pnpm prepare:daemon:local && pnpm build && electron-builder --dir --win --x64",
     "package:win": "pnpm prepare:daemon && pnpm build && electron-builder --win nsis --x64",
+    "package:win:local": "pnpm prepare:daemon:local && pnpm build && electron-builder --win nsis --x64",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

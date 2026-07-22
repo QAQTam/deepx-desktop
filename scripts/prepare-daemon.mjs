@@ -1,32 +1,108 @@
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const backendRoot = resolve(process.env.DEEPX_BACKEND_ROOT || join(projectRoot, "..", "DeepX"));
+const lock = JSON.parse(readFileSync(join(projectRoot, "deepx-backend.lock.json"), "utf8"));
+const args = parseArgs(process.argv.slice(2));
+const explicitBackend = args["backend-root"] || process.env.DEEPX_BACKEND_ROOT;
+const targetId = resolveTarget();
 const executable = process.platform === "win32" ? "deepx-daemon.exe" : "deepx-daemon";
+const destination = join(projectRoot, "build", "sidecar", executable);
 
-if (!existsSync(join(backendRoot, "Cargo.toml"))) {
-  throw new Error(
-    `DeepX backend was not found at ${backendRoot}. Set DEEPX_BACKEND_ROOT to the backend repository.`,
-  );
+validateDesktopProtocol();
+const desktopVersion = JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8").toString()).version;
+if (desktopVersion !== lock.version) throw new Error(`Desktop version ${desktopVersion} does not match backend lock ${lock.version}`);
+if (process.env.GITHUB_REF_NAME?.startsWith("v") && process.env.GITHUB_REF_NAME !== `v${desktopVersion}`) {
+  throw new Error(`Release tag ${process.env.GITHUB_REF_NAME} does not match Desktop version v${desktopVersion}`);
+}
+mkdirSync(dirname(destination), { recursive: true });
+
+if (explicitBackend) await stageLocalBackend(resolve(explicitBackend));
+else await stageReleaseArtifact();
+
+async function stageLocalBackend(backendRoot) {
+  const cargoToml = join(backendRoot, "Cargo.toml");
+  if (!existsSync(cargoToml)) throw new Error(`DeepX backend was not found at ${backendRoot}`);
+  const backendVersion = capture(readFileSync(cargoToml, "utf8"), /\[workspace\.package\][\s\S]*?version\s*=\s*"([^"]+)"/, "backend version");
+  const backendProtocol = Number(capture(readFileSync(join(backendRoot, "crates", "deepx-proto", "src", "control.rs"), "utf8"), /CONTROL_PROTOCOL_VERSION:\s*u16\s*=\s*(\d+)/, "backend protocol"));
+  if (backendVersion !== lock.version || backendProtocol !== lock.protocol_version) {
+    throw new Error(`Local backend ${backendVersion}/protocol ${backendProtocol} does not match lock ${lock.version}/protocol ${lock.protocol_version}`);
+  }
+
+  const build = spawnSync(process.platform === "win32" ? "cargo.exe" : "cargo", ["build", "--locked", "--release", "-p", "deepx-daemon"], {
+    cwd: backendRoot,
+    stdio: "inherit",
+    shell: false,
+  });
+  if (build.error) throw build.error;
+  if (build.status !== 0) process.exit(build.status ?? 1);
+
+  const source = join(backendRoot, "target", "release", executable);
+  if (!existsSync(source)) throw new Error(`Cargo completed without producing ${source}`);
+  copyFileSync(source, destination);
+  console.log(`Staged local backend ${source} -> ${destination}`);
 }
 
-const cargo = process.platform === "win32" ? "cargo.exe" : "cargo";
-const build = spawnSync(cargo, ["build", "--release", "-p", "deepx-daemon"], {
-  cwd: backendRoot,
-  stdio: "inherit",
-  shell: false,
-});
+async function stageReleaseArtifact() {
+  const response = await fetch(lock.release_manifest_url, { redirect: "follow" });
+  if (!response.ok) throw new Error(`Unable to download backend manifest: HTTP ${response.status} ${response.statusText}`);
+  const manifest = await response.json();
+  for (const field of ["version", "protocol_version", "git_commit"]) {
+    if (manifest[field] !== lock[field]) throw new Error(`Backend manifest ${field} does not match deepx-backend.lock.json`);
+  }
+  const artifact = manifest.artifacts?.[targetId];
+  if (!artifact?.url || !artifact?.sha256 || !artifact?.name) throw new Error(`Backend release has no ${targetId} artifact`);
 
-if (build.error) throw build.error;
-if (build.status !== 0) process.exit(build.status ?? 1);
+  const cacheDir = join(projectRoot, ".cache", "deepx", artifact.sha256);
+  const cached = join(cacheDir, artifact.name);
+  mkdirSync(cacheDir, { recursive: true });
+  if (!existsSync(cached) || sha256(readFileSync(cached)) !== artifact.sha256) {
+    const download = await fetch(artifact.url, { redirect: "follow" });
+    if (!download.ok) throw new Error(`Unable to download ${artifact.name}: HTTP ${download.status} ${download.statusText}`);
+    const bytes = Buffer.from(await download.arrayBuffer());
+    if (sha256(bytes) !== artifact.sha256) throw new Error(`Checksum mismatch for ${artifact.name}`);
+    writeFileSync(cached, bytes);
+  }
+  copyFileSync(cached, destination);
+  if (process.platform !== "win32") {
+    const { chmodSync } = await import("node:fs");
+    chmodSync(destination, 0o755);
+  }
+  console.log(`Staged locked backend ${lock.version} (${lock.git_commit.slice(0, 12)}) for ${targetId}`);
+}
 
-const source = join(backendRoot, "target", "release", executable);
-const destination = join(projectRoot, "build", "sidecar", executable);
-if (!existsSync(source)) throw new Error(`Cargo completed without producing ${source}`);
+function validateDesktopProtocol() {
+  const source = readFileSync(join(projectRoot, "electron", "controlClient.ts"), "utf8");
+  const protocol = Number(capture(source, /PROTOCOL_VERSION\s*=\s*(\d+)/, "Desktop protocol"));
+  if (protocol !== lock.protocol_version) throw new Error(`Desktop protocol ${protocol} does not match backend lock ${lock.protocol_version}`);
+}
 
-mkdirSync(dirname(destination), { recursive: true });
-copyFileSync(source, destination);
-console.log(`Staged ${source} -> ${destination}`);
+function resolveTarget() {
+  const platform = { win32: "windows", linux: "linux", darwin: "macos" }[process.platform];
+  const architecture = { x64: "x86_64", arm64: "arm64" }[process.arch];
+  if (!platform || !architecture) throw new Error(`Unsupported packaging target ${process.platform}-${process.arch}`);
+  return `${platform}-${architecture}`;
+}
+
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function parseArgs(values) {
+  const parsed = {};
+  for (let index = 0; index < values.length; index += 2) {
+    const key = values[index]?.replace(/^--/, "");
+    if (!key || !values[index + 1]) throw new Error(`Invalid argument near ${values[index] ?? "end"}`);
+    parsed[key] = values[index + 1];
+  }
+  return parsed;
+}
+
+function capture(content, pattern, label) {
+  const value = content.match(pattern)?.[1];
+  if (!value) throw new Error(`Unable to read ${label}`);
+  return value;
+}

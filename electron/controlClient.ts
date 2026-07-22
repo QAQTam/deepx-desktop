@@ -249,9 +249,12 @@ async function readDiscovery(): Promise<DaemonDiscovery> {
 
 function daemonPath(): string {
   const executable = process.platform === "win32" ? "deepx-daemon.exe" : "deepx-daemon";
+  const developmentBackend = process.env.DEEPX_BACKEND_ROOT
+    ? resolve(process.env.DEEPX_BACKEND_ROOT)
+    : resolve(app.getAppPath(), "..", "DeepX");
   return app.isPackaged
     ? join(process.resourcesPath, executable)
-    : resolve(app.getAppPath(), "..", "DeepX", "target", "debug", executable);
+    : join(developmentBackend, "target", "debug", executable);
 }
 
 function launchDaemon(): void {
