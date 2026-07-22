@@ -1,0 +1,272 @@
+import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { app } from "electron";
+import WebSocket from "ws";
+import type { BackendStatus, ControlMessage, DaemonDiscovery } from "./types";
+
+const PROTOCOL_VERSION = 1;
+const REQUEST_TIMEOUT_MS = 30_000;
+const START_TIMEOUT_MS = 8_000;
+
+type Pending = {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+};
+
+export class DaemonControlClient {
+  private socket?: WebSocket;
+  private connecting?: Promise<void>;
+  private heartbeat?: NodeJS.Timeout;
+  private reconnect?: NodeJS.Timeout;
+  private readonly pending = new Map<string, Pending>();
+  private readonly attached = new Set<string>();
+  private readonly clientId = `electron-${randomUUID()}`;
+  private stopped = false;
+  private status: BackendStatus = { connected: false };
+
+  constructor(
+    private readonly onMessage: (message: ControlMessage) => void,
+    private readonly onStatus: (status: BackendStatus) => void,
+  ) {}
+
+  currentStatus(): BackendStatus {
+    return { ...this.status };
+  }
+
+  async connect(): Promise<void> {
+    if (this.socket?.readyState === WebSocket.OPEN) return;
+    if (this.connecting) return this.connecting;
+    this.stopped = false;
+    this.connecting = this.connectOrLaunch().finally(() => { this.connecting = undefined; });
+    return this.connecting;
+  }
+
+  async request(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+    if (!method || typeof method !== "string") throw new Error("invalid backend method");
+    await this.connect();
+    return this.roundTrip({
+      type: "request",
+      request_id: randomUUID(),
+      method,
+      params,
+    });
+  }
+
+  async attach(seed: string): Promise<unknown> {
+    if (!seed) throw new Error("session seed is required");
+    await this.connect();
+    const result = await this.attachWire(seed);
+    this.attached.add(seed);
+    return result;
+  }
+
+  async detach(seed: string): Promise<unknown> {
+    if (!seed) throw new Error("session seed is required");
+    await this.connect();
+    const result = await this.roundTrip({
+      type: "session_detach",
+      request_id: randomUUID(),
+      seed,
+    });
+    this.attached.delete(seed);
+    return result;
+  }
+
+  close(): void {
+    this.stopped = true;
+    if (this.reconnect) clearTimeout(this.reconnect);
+    this.disconnectSocket();
+  }
+
+  private async connectOrLaunch(): Promise<void> {
+    try {
+      await this.connectDiscovery(await readDiscovery());
+      return;
+    } catch {}
+
+    launchDaemon();
+    const deadline = Date.now() + START_TIMEOUT_MS;
+    let lastError: unknown = new Error("daemon did not publish discovery");
+    while (Date.now() < deadline) {
+      await delay(120);
+      try {
+        await this.connectDiscovery(await readDiscovery());
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    const message = errorMessage(lastError);
+    this.setStatus({ connected: false, error: message });
+    throw new Error(message);
+  }
+
+  private async connectDiscovery(discovery: DaemonDiscovery): Promise<void> {
+    if (discovery.protocol_version !== PROTOCOL_VERSION) {
+      throw new Error(`daemon protocol ${discovery.protocol_version} is incompatible`);
+    }
+    const socket = new WebSocket(discovery.endpoint, {
+      headers: { Authorization: `Bearer ${discovery.token}` },
+      maxPayload: 64 * 1024 * 1024,
+      handshakeTimeout: 5_000,
+    });
+    this.socket = socket;
+
+    await new Promise<void>((resolveConnection, rejectConnection) => {
+      const timer = setTimeout(() => rejectConnection(new Error("daemon hello timed out")), 5_000);
+      const fail = (error: Error) => {
+        clearTimeout(timer);
+        rejectConnection(error);
+      };
+      socket.once("error", fail);
+      socket.once("open", () => {
+        socket.send(JSON.stringify({
+          type: "client_hello",
+          protocol_version: PROTOCOL_VERSION,
+          client_version: app.getVersion(),
+          client_kind: "electron",
+          client_instance_id: this.clientId,
+        }));
+      });
+      socket.on("message", data => {
+        let message: ControlMessage;
+        try { message = JSON.parse(data.toString()) as ControlMessage; }
+        catch { return; }
+        if (message.type === "server_hello") {
+          clearTimeout(timer);
+          socket.off("error", fail);
+          resolveConnection();
+          return;
+        }
+        this.handleMessage(message);
+      });
+      socket.once("close", () => {
+        clearTimeout(timer);
+        rejectConnection(new Error("daemon closed during handshake"));
+      });
+    });
+
+    socket.on("close", () => this.handleDisconnect("daemon connection closed"));
+    socket.on("error", error => {
+      if (socket.readyState !== WebSocket.OPEN) this.handleDisconnect(error.message);
+    });
+    this.startHeartbeat();
+    this.setStatus({ connected: true });
+    for (const seed of this.attached) await this.attachWire(seed);
+  }
+
+  private handleMessage(message: ControlMessage): void {
+    const requestId = typeof message.request_id === "string" ? message.request_id : undefined;
+    if (requestId && (message.type === "response" || message.type === "error" || message.type === "lease_denied")) {
+      const pending = this.pending.get(requestId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pending.delete(requestId);
+        if (message.type === "response") pending.resolve(message.result);
+        else pending.reject(new Error(`${String(message.code ?? message.type)}: ${String(message.message ?? "request failed")}`));
+      }
+    }
+    this.onMessage(message);
+  }
+
+  private async attachWire(seed: string): Promise<unknown> {
+    return this.roundTrip({ type: "session_attach", request_id: randomUUID(), seed });
+  }
+
+  private roundTrip(message: ControlMessage): Promise<unknown> {
+    const requestId = String(message.request_id ?? "");
+    if (!requestId || this.socket?.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("daemon disconnected"));
+    }
+    return new Promise((resolveRequest, rejectRequest) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(requestId);
+        rejectRequest(new Error("daemon request timed out"));
+      }, REQUEST_TIMEOUT_MS);
+      this.pending.set(requestId, { resolve: resolveRequest, reject: rejectRequest, timer });
+      this.socket!.send(JSON.stringify(message), error => {
+        if (!error) return;
+        clearTimeout(timer);
+        this.pending.delete(requestId);
+        rejectRequest(error);
+      });
+    });
+  }
+
+  private startHeartbeat(): void {
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    let nonce = 0;
+    this.heartbeat = setInterval(() => {
+      if (this.socket?.readyState === WebSocket.OPEN) {
+        this.socket.send(JSON.stringify({ type: "heartbeat", nonce: ++nonce }));
+      }
+    }, 5_000);
+  }
+
+  private handleDisconnect(reason: string): void {
+    if (this.socket?.readyState === WebSocket.OPEN) return;
+    this.disconnectSocket();
+    this.setStatus({ connected: false, error: reason });
+    if (!this.stopped && !this.reconnect) {
+      this.reconnect = setTimeout(() => {
+        this.reconnect = undefined;
+        void this.connect().catch(() => this.handleDisconnect("daemon reconnect failed"));
+      }, 1_000);
+    }
+  }
+
+  private disconnectSocket(): void {
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = undefined;
+    const socket = this.socket;
+    this.socket = undefined;
+    if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("daemon disconnected"));
+    }
+    this.pending.clear();
+  }
+
+  private setStatus(status: BackendStatus): void {
+    this.status = status;
+    this.onStatus({ ...status });
+  }
+}
+
+function deepxDataDir(): string {
+  if (process.platform === "win32") return join(process.env.USERPROFILE || homedir(), ".deepx");
+  return join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "deepx");
+}
+
+async function readDiscovery(): Promise<DaemonDiscovery> {
+  return JSON.parse(await readFile(join(deepxDataDir(), "daemon.json"), "utf8")) as DaemonDiscovery;
+}
+
+function daemonPath(): string {
+  const executable = process.platform === "win32" ? "deepx-daemon.exe" : "deepx-daemon";
+  return app.isPackaged
+    ? join(process.resourcesPath, executable)
+    : resolve(app.getAppPath(), "..", "DeepX", "target", "debug", executable);
+}
+
+function launchDaemon(): void {
+  const child = spawn(daemonPath(), ["run"], {
+    detached: true,
+    windowsHide: true,
+    stdio: "ignore",
+  });
+  child.unref();
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolveDelay => setTimeout(resolveDelay, ms));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
