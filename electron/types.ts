@@ -19,6 +19,8 @@ export interface DaemonManifest {
 
 export type ControlMessage = {
   type: string;
+  server_epoch?: string;
+  seq?: number;
   request_id?: string;
   code?: string;
   message?: string;

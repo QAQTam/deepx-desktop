@@ -1,21 +1,20 @@
-# DeepX Desktop migration gate
+# DeepX Desktop migration record
 
-`deepx-desktop` is the independent Electron client for the v0.9 daemon architecture.
-The legacy Tauri shell remains only as a temporary parity reference and must not gain
-new backend business logic.
+`deepx-desktop` is the sole graphical client for the DeepX daemon architecture.
+The temporary Tauri parity implementation was retired from the backend workspace
+after the Electron client reached feature parity.
 
-The Tauri crate can be removed from the DeepX workspace after these gates pass:
+The completed migration covers:
 
-- daemon discovery, launch, authentication, reconnect, resume, and session leases;
+- daemon discovery, authenticated launch, reconnect cursor and session leases;
 - session list/history, streaming output, tools, permissions, Ask, Plan, Skills,
-  Goal/Task, Git, settings, statistics, cancel, compact, and message rollback;
-- native folder selection, external links, notifications, and window behavior;
-- Windows packaging includes `deepx-daemon.exe` without console windows or coupling
-  daemon lifetime to the desktop process;
-- Windows end-to-end and reconnect soak tests pass, and Linux packaging is visually
-  accepted;
-- no renderer import or IPC method references the old Tauri command surface.
+  Goal/Task, Git, settings, statistics, cancel, compact and message rollback;
+- native folder selection, confirmation dialogs, external links and local paths;
+- explicit lease release during application shutdown;
+- Windows packaging with `deepx-daemon.exe` detached from the desktop lifetime;
+- a renderer boundary with sandboxing, context isolation and no Node.js access.
 
-Once the gates pass, remove `deepx-tauri`, its command registration, and its bundled
-frontend from `D:\DeepX` in one commit. Storage and protocol compatibility remain
-owned by `deepx-daemon`; they are not part of the shell removal.
+Backend storage and protocol compatibility remain owned by `deepx-daemon`.
+The renderer must not read `.deepx`, the discovery token or business files directly.
+Future desktop features belong in this repository and must use the versioned control
+protocol instead of recreating backend logic in Electron.

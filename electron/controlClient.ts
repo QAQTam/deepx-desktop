@@ -7,11 +7,13 @@ import { app } from "electron";
 import WebSocket from "ws";
 import { daemonIdentityMismatch, hasActiveDaemonWork, type ExpectedDaemonIdentity } from "../src/runtime/daemonLifecycle";
 import { ControlEventBatcher } from "../src/runtime/controlEventBatcher";
+import { ControlCursor } from "../src/runtime/controlCursor";
 import type { BackendStatus, ControlMessage, DaemonDiscovery, DaemonManifest } from "./types";
 
 const PROTOCOL_VERSION = 1;
 const REQUEST_TIMEOUT_MS = 30_000;
 const START_TIMEOUT_MS = 8_000;
+const CLOSE_TIMEOUT_MS = 1_500;
 
 type Pending = {
   resolve: (value: unknown) => void;
@@ -27,11 +29,13 @@ export class DaemonControlClient {
   private upgradeCheck?: NodeJS.Timeout;
   private streamFlush?: NodeJS.Timeout;
   private readonly eventBatcher = new ControlEventBatcher();
+  private readonly cursor = new ControlCursor();
   private readonly pending = new Map<string, Pending>();
   private readonly attached = new Set<string>();
   private readonly clientId = `electron-${randomUUID()}`;
   private stopped = false;
   private restarting = false;
+  private closing?: Promise<void>;
   private status: BackendStatus = { connected: false };
 
   constructor(
@@ -82,11 +86,28 @@ export class DaemonControlClient {
     return result;
   }
 
-  close(): void {
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
     this.stopped = true;
     if (this.reconnect) clearTimeout(this.reconnect);
     if (this.upgradeCheck) clearTimeout(this.upgradeCheck);
-    this.disconnectSocket();
+    this.closing = this.releaseLeases().finally(() => this.disconnectSocket());
+    return this.closing;
+  }
+
+  private async releaseLeases(): Promise<void> {
+    const seeds = [...this.attached];
+    if (seeds.length === 0 || this.socket?.readyState !== WebSocket.OPEN) {
+      this.attached.clear();
+      return;
+    }
+    const detachAll = Promise.allSettled(seeds.map(seed => this.roundTrip({
+      type: "session_detach",
+      request_id: randomUUID(),
+      seed,
+    })));
+    await Promise.race([detachAll, delay(CLOSE_TIMEOUT_MS)]);
+    this.attached.clear();
   }
 
   private async connectOrLaunch(): Promise<void> {
@@ -209,12 +230,15 @@ export class DaemonControlClient {
       };
       socket.once("error", fail);
       socket.once("open", () => {
+        const resume = this.cursor.resume();
         socket.send(JSON.stringify({
           type: "client_hello",
           protocol_version: PROTOCOL_VERSION,
           client_version: app.getVersion(),
           client_kind: "electron",
           client_instance_id: this.clientId,
+          after_epoch: resume?.after_epoch,
+          after_seq: resume?.after_seq,
         }));
       });
       socket.on("message", data => {
@@ -245,6 +269,7 @@ export class DaemonControlClient {
   }
 
   private handleMessage(message: ControlMessage): void {
+    this.cursor.observe(message);
     const requestId = typeof message.request_id === "string" ? message.request_id : undefined;
     if (requestId && (message.type === "response" || message.type === "error" || message.type === "lease_denied")) {
       const pending = this.pending.get(requestId);

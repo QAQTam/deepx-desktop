@@ -4,6 +4,7 @@ import { DaemonControlClient } from "./controlClient";
 import type { ConfirmDialogOptions, OpenDialogOptions } from "./types";
 
 let mainWindow: BrowserWindow | undefined;
+let quitting = false;
 const smokeMode = process.env.DEEPX_DESKTOP_SMOKE === "1" || process.argv.includes("--deepx-smoke");
 const backend = new DaemonControlClient(
   message => sendToRenderer("backend:message", message),
@@ -12,7 +13,7 @@ const backend = new DaemonControlClient(
 
 if (smokeMode) {
   setTimeout(() => {
-    backend.close();
+    void backend.close();
     console.error("Electron smoke test timed out before the preload/backend bridge was ready");
     app.exit(1);
   }, 30_000);
@@ -51,7 +52,7 @@ function createWindow(): void {
           console.error("Electron backend lifecycle smoke test failed:", error);
         }
       }
-      backend.close();
+      await backend.close();
       if (!bridgeReady) console.error("Electron preload bridge was not exposed to the renderer");
       if (!backendReady) console.error("Electron could not connect to a compatible daemon");
       app.exit(bridgeReady && backendReady ? 0 : 1);
@@ -137,4 +138,9 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("before-quit", () => backend.close());
+app.on("before-quit", event => {
+  if (quitting) return;
+  event.preventDefault();
+  quitting = true;
+  void backend.close().finally(() => app.quit());
+});
